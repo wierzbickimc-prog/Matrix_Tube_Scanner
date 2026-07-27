@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 .uv-bin/
 install.log
+.installation_complete
