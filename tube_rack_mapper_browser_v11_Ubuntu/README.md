@@ -200,3 +200,41 @@ NODE_PATH=/path/to/playwright/node_modules node tests/browser_smoke.cjs
 Set `SCANNER_URL` for a different preview URL and `CHROME_BIN` for a different
 Chrome executable. Tests use a simulated camera; a physical rack/webcam trial is
 still required to assess image sharpness and tube read rate.
+
+## v12 Double-rib plate rewrite
+
+The Double-rib profile was rebuilt after full-size phone photos failed:
+
+- **Any resolution.** v11 used fixed pixel sizes, so a 4284 x 5712 phone photo
+  found no wells and Auto fell through to a scrambled Notched-plate result.
+  Geometry is now fitted on a fixed-size working copy, and decoding uses the
+  full-resolution photo (whole-image pass plus a downsampled pass, then
+  perspective-corrected per-well crops).
+- **Lattice.** Empty square openings and decoded tube codes are both used as
+  lattice points; the grid is grown neighbour-to-neighbour (handles oblique
+  shots and missing wells) and the 8 x 12 window is placed on the beige walls.
+  v11's k-means fit could shift a whole column on an angled photo.
+- **Presence.** Tube presence uses fine Data-Matrix-scale texture in the cap
+  circle. Glare on the tray floor and brightly lit walls are smooth and no
+  longer read as occupied tubes.
+- **Plate ID.** v11's plate-ID search strip overlapped the edge well row, so an
+  edge tube's code was reported as the plate ID and that tube was suppressed.
+  A plate ID is now reported only for a code clearly outside the well field.
+- **Auto.** Double-rib is chosen only when the wall midpoints between fitted
+  wells are beige plastic (>= 80%) and no code sits off the well lattice (the
+  Original tray's rack marker is half a pitch off the edge row).
+- The H12 double-rib orientation logic is unchanged. Original tray and Notched
+  plate results are unchanged on every reference photo.
+
+Results: the 42-tube phone photo (`test_images/double_rib_42_fullres.jpg`)
+decodes 42/42 at full, 2048 and 1536 px with identical maps; the five 14-tube
+references (IMG_9376-9380) now have exact tube presence in every orientation.
+Their tubes are frosted and each code is ~20 px, so most stay UNREADABLE
+at that resolution - photograph at full camera resolution.
+Dot-peen tube codes (separate dots rather than solid modules) can defeat
+zxing on otherwise sharp crops. Unread occupied wells get a dot-merging sweep
+(blur / close / dilate at several scales), then a cap-masked rotation sweep,
+then a retry at two other crop sizes. The lattice RNG is seeded so a photo
+always gives the same result. The 36-tube photo
+(`test_images/double_rib_36_fullres.jpg`, scattered gaps) reads 36/36.
+`tests/test_double_rib.py` covers all three cases.
