@@ -1,7 +1,7 @@
-# 96-Tube Rack Mapper — v11 (Ubuntu)
+# Built Tube Scanner — Ubuntu
 
-This is the Ubuntu/Linux variant of the v11 mapper. It has the same scanning
-logic as the macOS package, with Linux-native scripts.
+Built Tube Scanner adds image upload and browser webcam capture to the v11
+Ubuntu/Linux rack mapper. The existing rack decoding logic is unchanged.
 
 ## Ubuntu install and run
 
@@ -149,3 +149,54 @@ Auto mode now requires all three of the following:
 Detecting an external rack/plate Data Matrix vetoes the Double-rib profile in
 Auto mode. The Double-rib logic remains isolated from the Original and
 Notched profiles.
+
+## Built Tube Scanner — browser capture
+
+The Ubuntu web app now uses Built's plum/violet branding and a magnifying-glass /
+Data Matrix icon. The existing three rack profiles, 96-position review table,
+confidence map, tube crops, and CSV format are preserved.
+
+- **Upload image:** JPG, PNG, TIFF (including .jpeg/.tiff).
+- **Webcam:** continuous white page lighting; click **Enable camera** and allow
+  browser camera access. Hold the complete rack's barcode side toward the camera.
+  **Full screen light** expands the white surface; increase display brightness
+  using the computer's controls if needed.
+- Press **Space** or **Capture in 3 seconds**. Review the frozen, unmirrored photo,
+  then **Use this photo** or **Retake**. Choose the rack style and **Start analysis**.
+- Camera video stays in the browser; accepting a photo sends only that JPEG to
+  the scanner server. Camera tracks stop after capture, on exit, or when the tab
+  is hidden. A hidden camera tab requires enabling the camera again.
+- **Exit camera** returns to upload. The camera requests the best available
+  resolution up to a preferred 3840×2160 and displays the actual resolution.
+  Full-rack decoding depends on webcam focus/resolution and the physical barcode
+  size. Check tiny barcode squares in the still; use a higher-resolution uploaded
+  photo if a built-in webcam cannot resolve them.
+
+Camera access requires HTTPS (or localhost) and browser permission. The existing
+Ubuntu route is `/matrix`; its service is `tube-rack-mapper.service`. No new port
+or proxy route is needed. Camera captures are limited to 20 MiB and validated as
+JPEGs before entering the decoder. New photos, retakes, source changes, or rack
+setting changes clear previous results; rerunning analysis also clears old edits.
+
+### Verification
+
+From this directory, using the installed Python environment:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+node --check webcam/camera.js
+```
+
+`tests/browser_smoke.cjs` exercises the real Streamlit component, simulated camera,
+fullscreen, countdown/cancel, accepted still, retake/exit, denied permission,
+sample-rack decoding, CSV shape, and invalidation after a setting change. It needs
+Playwright and Chrome; neither is a production dependency. With a loopback preview
+running on port 18525:
+
+```sh
+NODE_PATH=/path/to/playwright/node_modules node tests/browser_smoke.cjs
+```
+
+Set `SCANNER_URL` for a different preview URL and `CHROME_BIN` for a different
+Chrome executable. Tests use a simulated camera; a physical rack/webcam trial is
+still required to assess image sharpness and tube read rate.

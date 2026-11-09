@@ -1,0 +1,22 @@
+:root { color-scheme: light; }
+.stApp { background: #faf8fd; color: #29192f; }
+[data-testid="stHeader"] { background: transparent; }
+.block-container { max-width: 1220px; padding-top: 4.5rem; padding-bottom: 4rem; }
+.built-header { display: flex; gap: 16px; align-items: center; border-bottom: 1px solid #e5dcec; padding: 0 0 22px; margin-bottom: 28px; }
+.built-header img { width: 60px; height: 60px; }
+.built-wordmark { color: #4b1f4f; font-size: 13px; font-weight: 750; letter-spacing: .17em; }
+.built-product { font-size: 20px; font-weight: 700; margin-top: 3px; }
+.built-tag { margin-left: auto; border: 1px solid #e2d7eb; border-radius: 30px; padding: 7px 13px; font-size: 12px; color: #6f557d; }
+.built-eyebrow { color: #7c3aed; font-size: 11px; letter-spacing: .16em; font-weight: 750; margin-bottom: 8px; }
+h1 { color: #29192f !important; letter-spacing: -.04em !important; font-size: clamp(2rem, 4vw, 2.8rem) !important; padding-top: 0 !important; }
+h2, h3, h4 { color: #4b1f4f !important; letter-spacing: -.025em; }
+[data-testid="stVerticalBlockBorderWrapper"] > div { border-color: #e5dcec; border-radius: 18px; background: #fff; }
+.st-key-capture_card, .st-key-scan_card { background: #fff; border-color: #e5dcec !important; border-radius: 18px !important; }
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] { background: #6d3bd1; border-color: #6d3bd1; border-radius: 10px; }
+[data-testid="stBaseButton-primary"]:hover { background: #4b1f4f; border-color: #4b1f4f; }
+[data-testid="stFileUploaderDropzone"] { background: #faf8fd; border: 1px dashed #d2bce7; border-radius: 12px; }
+[data-testid="stMetric"] { background: #fff; border: 1px solid #e5dcec; border-radius: 14px; padding: 16px; }
+[data-testid="stMetricValue"] { color: #4b1f4f; }
+[data-testid="stCaptionContainer"] { color: #71657b; }
+button, input, select { accent-color: #7c3aed; }
+@media (max-width: 600px) { .built-tag { display:none; } .block-container { padding: 4.5rem 1rem 1.5rem; } }

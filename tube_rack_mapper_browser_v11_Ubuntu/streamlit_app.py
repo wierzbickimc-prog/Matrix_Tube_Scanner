@@ -1,69 +1,111 @@
-
 from __future__ import annotations
+
+import base64
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
+from capture import camera_image, source_key
 from core import REVIEW_THRESHOLD, RackResult, analyze_image_bytes
 
-st.set_page_config(page_title="96-Tube Rack Mapper", page_icon="🧪", layout="wide")
-st.title("96-Tube Rack Mapper")
-st.caption("Upload a rack image, choose the rack style, then press Start Analysis. Auto now uses plate-ID barcode presence as a profile rule.")
-
-uploaded = st.file_uploader("Rack image", type=["jpg", "jpeg", "png", "tif", "tiff"])
-
-profile = st.selectbox(
-    "Rack style",
-    options=["Auto", "Original tray", "Notched plate", "Double-rib plate"],
-    index=0,
-    help=(
-        "Original tray: molded white rack with rack barcode. Notched plate: A1 notch / column-1 "
-        "barcode. Double-rib plate: NO plate-ID barcode; beige square-well plate with the paired H12 "
-        "support rib."
-    ),
+ROOT = Path(__file__).resolve().parent
+LOGO = ROOT / "assets" / "scanner.svg"
+webcam = components.declare_component("built_rack_camera", path=str(ROOT / "webcam"))
+st.set_page_config(page_title="Built Tube Scanner", page_icon=str(LOGO), layout="wide")
+st.markdown(f"<style>{(ROOT / 'assets' / 'theme.css').read_text()}</style>", unsafe_allow_html=True)
+logo_data = base64.b64encode(LOGO.read_bytes()).decode("ascii")
+st.markdown(
+    f'<div class="built-header"><img src="data:image/svg+xml;base64,{logo_data}" alt="Built Tube Scanner logo">'
+    '<div><div class="built-wordmark">BUILT BIOTECHNOLOGIES</div><div class="built-product">Tube Scanner</div></div>'
+    '<span class="built-tag">96-well rack · Data Matrix</span></div>'
+    '<div class="built-eyebrow">FROM RACK TO RECORD</div>',
+    unsafe_allow_html=True,
 )
+st.title("Every tube. In its place.")
+st.caption("Capture a rack, review the tube codes, and export a plate map.")
 
-plate_id_override = st.text_input(
-    "Plate ID override (optional)",
-    value="",
-    help=(
-        "Useful for a double-rib plate photo when the rack-level Data Matrix "
-        "is not visible. Tube decoding and orientation still run normally."
-    ),
-)
 
-double_rib_corner_override = st.selectbox(
-    "Double-rib H12 corner override (fallback)",
-    options=["Auto", "Top-left", "Top-right", "Bottom-left", "Bottom-right"],
-    index=0,
-    help=(
-        "Normally leave this on Auto. For a Double-rib plate, select the corner "
-        "of the uploaded photo where the paired H12 support ribs are visibly located "
-        "if automatic orientation is wrong."
-    ),
-)
+def change_source():
+    # A remounted camera must never revive a still from an earlier webcam session.
+    st.session_state["camera_epoch"] = st.session_state.get("camera_epoch", 0) + 1
 
-left_button, _ = st.columns([1, 5])
-with left_button:
-    start = st.button("Start Analysis", type="primary", disabled=uploaded is None, width="stretch")
 
-if uploaded is not None:
-    st.image(uploaded, caption="Uploaded image", width=420)
+if st.session_state.pop("exit_camera", False):
+    st.session_state["image_source"] = "Upload image"
+    change_source()
+mode = st.radio("Image source", ["Upload image", "Webcam"], horizontal=True, key="image_source", on_change=change_source)
+image_bytes = None
+with st.container(border=True, key="capture_card"):
+    if mode == "Upload image":
+        st.subheader("01 / Add your rack image")
+        st.caption("Include the whole rack, all tube bottoms, and any rack barcode. A sharp, evenly lit photo works best.")
+        uploaded = st.file_uploader("Rack image", type=["jpg", "jpeg", "png", "tif", "tiff"])
+        if uploaded is not None:
+            image_bytes = uploaded.getvalue()
+            st.image(image_bytes, caption=uploaded.name, width=420)
+    else:
+        # White lighting lasts for the whole webcam mode, including still review.
+        st.markdown("<style>.stApp, [data-testid='stHeader'] {background: #fff !important;}</style>", unsafe_allow_html=True)
+        value = webcam(key=f"rack_camera_{st.session_state.get('camera_epoch', 0)}", default=None)
+        if isinstance(value, dict) and value.get("event") == "exit":
+            st.session_state["exit_camera"] = True
+            st.rerun()
+        if isinstance(value, dict) and value.get("event") == "capture":
+            try:
+                image_bytes = camera_image(value)
+            except ValueError as exc:
+                st.error(str(exc))
 
-if start:
+with st.container(border=True, key="scan_card"):
+    st.subheader("02 / Set up the scan")
+    rack_col, id_col = st.columns(2)
+    with rack_col:
+        profile = st.selectbox(
+            "Rack style",
+            options=["Auto", "Original tray", "Notched plate", "Double-rib plate"],
+            help="Auto detects the rack profile. Include the rack barcode or the paired H12 ribs for orientation.",
+        )
+    with id_col:
+        plate_id_override = st.text_input(
+            "Plate ID override (optional)",
+            help="Use when the rack-level Data Matrix is not visible, including double-rib plates.",
+        )
+    with st.expander("Orientation fallback"):
+        double_rib_corner_override = st.selectbox(
+            "Double-rib H12 corner override (fallback)",
+            options=["Auto", "Top-left", "Top-right", "Bottom-left", "Bottom-right"],
+            help="Leave on Auto unless double-rib orientation is wrong. Choose the photo corner containing the paired H12 support ribs.",
+        )
+
+
+    current_source = source_key(image_bytes, mode, profile, plate_id_override, double_rib_corner_override)
+    if current_source is None or st.session_state.get("result_source") != current_source:
+        st.session_state.pop("rack_result", None)
+        st.session_state.pop("result_source", None)
+    start = st.button("Start analysis", type="primary", disabled=image_bytes is None)
+    if image_bytes is None:
+        st.caption("Upload an image or choose a webcam photo to continue.")
+
+if start and image_bytes is not None:
+    # Clear previous edits even when explicitly reanalyzing the same photo.
+    st.session_state["analysis_generation"] = st.session_state.get("analysis_generation", 0) + 1
+    st.session_state.pop("rack_result", None)
+    st.session_state.pop("result_source", None)
     with st.spinner("Decoding rack and tube Data Matrix codes…"):
         try:
             result = analyze_image_bytes(
-                uploaded.getvalue(),
+                image_bytes,
                 profile_choice=profile,
                 plate_id_override=plate_id_override,
                 double_rib_corner_override=double_rib_corner_override,
             )
         except Exception as exc:
-            st.session_state.pop("rack_result", None)
             st.error(str(exc))
         else:
             st.session_state["rack_result"] = result
+            st.session_state["result_source"] = current_source
             st.success(f"Analysis complete. Profile used: {result.profile_name}")
 
 result: RackResult | None = st.session_state.get("rack_result")
@@ -129,13 +171,13 @@ if result is not None:
             "DataMatrix": st.column_config.TextColumn("DataMatrix", help="Correct the decoded value, or enter EMPTY / UNREADABLE."),
             "Confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
         },
-        key="result_editor",
+        key=f"result_editor_{st.session_state.get('analysis_generation', 0)}",
     )
 
     review_positions = [well.position for well in result.wells if well.value == "UNREADABLE" or well.confidence < REVIEW_THRESHOLD]
     all_positions = [well.position for well in result.wells]
     st.markdown("#### Inspect a tube crop")
-    selected = st.selectbox("Position", options=review_positions or all_positions)
+    selected = st.selectbox("Position", options=review_positions or all_positions, key=f"crop_{st.session_state.get('analysis_generation', 0)}")
     selected_well = next(well for well in result.wells if well.position == selected)
     st.image(selected_well.crop_rgb, caption=f"{selected_well.position}: {selected_well.value} ({selected_well.confidence:.1f}%)", width=280)
 

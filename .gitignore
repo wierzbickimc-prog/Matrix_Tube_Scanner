@@ -5,3 +5,4 @@ __pycache__/
 .uv-bin/
 install.log
 .installation_complete
+streamlit.log

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Built Tube Scanner camera</title><link rel="stylesheet" href="camera.css"></head>
+<body>
+<main id="camera">
+  <header><div><span class="eyebrow">WEBCAM · WHITE LIGHT</span><h2>Bring the whole rack into view.</h2></div><button id="exit" class="quiet">Exit camera</button></header>
+  <p class="intro">Hold the barcode side toward your webcam. Keep all 96 tube bottoms and the rack edges in view.</p>
+  <div id="stage" tabindex="0" aria-label="Rack camera preview. Press Space to capture.">
+    <video id="video" autoplay muted playsinline hidden></video>
+    <img id="photo" alt="Captured rack, ready to review" hidden>
+    <div id="placeholder"><svg viewBox="0 0 48 48" aria-hidden="true"><rect x="7" y="13" width="34" height="25" rx="5"/><path d="m16 13 3-5h10l3 5"/><circle cx="24" cy="25" r="7"/></svg><strong>Your camera preview appears here</strong><span>The surrounding white screen lights the rack.</span></div>
+    <div id="guide" hidden><span>Whole rack · include every edge</span></div>
+    <div id="countdown" role="status" aria-live="assertive" hidden></div>
+  </div>
+  <p id="status" role="status" aria-live="polite">Camera is off. Choose Enable camera and allow camera access in your browser.</p>
+  <div class="controls">
+    <button id="enable" class="primary">Enable camera</button>
+    <button id="capture" class="primary" hidden>Capture in 3 seconds</button>
+    <button id="use" class="primary" hidden>Use this photo</button>
+    <button id="retake" hidden>Retake</button>
+    <button id="cancel" hidden>Cancel countdown</button>
+    <button id="fullscreen">Full screen light</button>
+  </div>
+  <p class="tip">Turn up your display brightness for more light. <span id="shortcut">Space to capture · Esc to exit.</span> Keep the rack steady; check that the tiny barcode squares look sharp.</p>
+  <p class="privacy">Live video stays in your browser. Only the photo you choose is sent for decoding.</p>
+</main><script src="camera.js"></script>
+</body></html>

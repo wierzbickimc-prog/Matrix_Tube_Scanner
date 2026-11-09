@@ -7,15 +7,29 @@ if [ ! -f .installation_complete ] || [ ! -x .venv/bin/python ]; then
   exit 1
 fi
 
-PORT=8501
+PORT="${TUBE_MAPPER_PORT:-8501}"
+BASE_URL_PATH="${TUBE_MAPPER_BASE_URL_PATH:-}"
 URL="http://localhost:${PORT}"
+if [[ -n "$BASE_URL_PATH" ]]; then
+  BASE_URL_PATH="${BASE_URL_PATH#/}"
+  URL+="/${BASE_URL_PATH}"
+fi
 echo "Starting 96-Tube Rack Mapper at $URL"
 
+streamlit_args=(
+  --server.address localhost
+  --server.port "$PORT"
+  --server.headless true
+  --browser.gatherUsageStats false
+)
+if [[ -n "$BASE_URL_PATH" ]]; then
+  # Tailscale Funnel mounts this application below /matrix. Streamlit must
+  # know the prefix so its assets and WebSocket endpoint use that same path.
+  streamlit_args+=(--server.baseUrlPath "$BASE_URL_PATH")
+fi
+
 .venv/bin/python -m streamlit run streamlit_app.py \
-  --server.address localhost \
-  --server.port "$PORT" \
-  --server.headless true \
-  --browser.gatherUsageStats false &
+  "${streamlit_args[@]}" &
 SERVER_PID=$!
 
 cleanup() { kill "$SERVER_PID" >/dev/null 2>&1 || true; }
