@@ -135,3 +135,18 @@ Auto mode now requires all three of the following:
 Detecting an external rack/plate Data Matrix vetoes the Double-rib profile in
 Auto mode. The Double-rib logic remains isolated from the Original and
 Notched profiles.
+
+## v12 Double-rib plate and labelled trays
+
+`core.py` is shared with the Ubuntu build and includes the v12 Double-rib
+rewrite: any photo resolution (full-size phone photos included), a lattice
+grown from well openings and tube codes, texture-based tube presence, and
+dot-peen decode retries. Auto also accepts a double-rib plate sitting in a
+labelled tray: a rack Data Matrix beside H12 becomes the plate ID. Original
+tray and Notched plate results are unchanged.
+
+Check the build from this folder with the installed environment:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```

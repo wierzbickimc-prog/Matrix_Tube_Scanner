@@ -1,7 +1,8 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -2146,7 +2147,7 @@ def _double_rib_auto_evidence(
         "no external plate-ID barcode"
     )
 
-def analyze_double_rib_plate(
+def analyze_double_rib_plate_legacy(
     image_bgr: np.ndarray,
     plate_id_override: Optional[str] = None,
     double_rib_corner_override: Optional[str] = None,
@@ -2274,9 +2275,554 @@ def analyze_double_rib_plate(
         ),
         overlay_rgb=overlay,
         profile_name=(
-            "Double-rib plate — square-well lattice / H12 rib anchor"
+            "Double-rib plate — v11 square-well lattice / H12 rib anchor"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# v12 Double-rib plate: resolution-independent lattice, full-resolution decode
+# ---------------------------------------------------------------------------
+#
+# v11 detected square openings with fixed pixel-area limits, so a full-size
+# phone photo (e.g. 4284 x 5712) found no wells, and its k-means lattice fit
+# could shift a whole column on oblique shots. Tube presence was a brightness
+# threshold that called glare and lit walls "occupied", and the plate-ID search
+# strip overlapped the first well row, so an edge tube's code became the "plate
+# ID" and that tube was then suppressed.
+#
+# v12:
+#   * fits geometry on a fixed-size working copy; lattice points are dark
+#     square openings (size-relative limits) plus whole-image Data Matrix hits;
+#   * grows the lattice neighbour-to-neighbour, refines a homography, and places
+#     the 8 x 12 window where the plate's beige walls are;
+#   * keeps the v10/v11 H12 double-rib orientation logic unchanged;
+#   * reads whole-image codes at full and reduced resolution, then decodes the
+#     remaining occupied wells from perspective-corrected full-resolution crops;
+#   * decides presence from Data-Matrix-scale texture (glare is smooth);
+#   * reports a plate ID only for a code clearly outside the well field.
+
+DR12_WORK_LONG_SIDE = 2048
+
+
+def _dr12_work_image(image_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+    h, w = image_bgr.shape[:2]
+    scale = DR12_WORK_LONG_SIDE / max(h, w)
+    if abs(scale - 1.0) < 0.02:
+        return image_bgr, 1.0
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    return cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=interp), scale
+
+
+def _dr12_full_image_codes(image_bgr: np.ndarray) -> list[tuple[str, np.ndarray, float]]:
+    """(text, center_xy, symbol_side_px) for every Data Matrix in the full image."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    long_side = max(gray.shape)
+    passes = [(gray, 1.0)]
+    if long_side > 2600:
+        # Phone photos: a downsampled copy smooths the dot pattern and often
+        # decodes symbols the full-resolution pass misses.
+        f = 2048.0 / long_side
+        passes.append((cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA), f))
+    if long_side < 3000:
+        passes.append((cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC), 2.0))
+    found: dict[str, tuple[np.ndarray, float]] = {}
+    for img, s in passes:
+        for binarizer in (zxingcpp.Binarizer.LocalAverage, zxingcpp.Binarizer.GlobalHistogram):
+            for code in zxingcpp.read_barcodes(img, formats=zxingcpp.BarcodeFormat.DataMatrix, binarizer=binarizer):
+                text = code.text.strip().lower()
+                if not text or text in found:
+                    continue
+                p = code.position
+                pts = np.array([[p.top_left.x, p.top_left.y], [p.top_right.x, p.top_right.y],
+                                [p.bottom_right.x, p.bottom_right.y], [p.bottom_left.x, p.bottom_left.y]], float) / s
+                side = float(np.mean([np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]))
+                found[text] = (pts.mean(axis=0), side)
+    return [(t, c, s) for t, (c, s) in found.items()]
+
+
+def _dr12_dark_square_candidates(work_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Centers and sizes of dark, square-ish openings (empty wells)."""
+    gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
+    long_side = max(gray.shape)
+    block = int(long_side / 20) | 1
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 8)
+    k = max(3, int(long_side / 400))
+    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(thr, 8)
+    min_side, max_side = long_side / 45.0, long_side / 9.0
+    out, sizes = [], []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if not (min_side <= w <= max_side and min_side <= h <= max_side):
+            continue
+        if not 0.6 < w / h < 1.65:
+            continue
+        if area / float(w * h) < 0.45:
+            continue
+        out.append(cents[i])
+        sizes.append(np.sqrt(w * h))
+    return np.asarray(out, float).reshape(-1, 2), np.asarray(sizes, float)
+
+
+def _dr12_dominant_size_filter(points: np.ndarray, sizes: np.ndarray) -> np.ndarray:
+    if len(points) < 8:
+        return points
+    logs = np.log(sizes)
+    best, best_count = None, -1
+    for center in logs:
+        count = int((np.abs(logs - center) < 0.18).sum())
+        if count > best_count:
+            best, best_count = center, count
+    keep = np.abs(logs - best) < 0.25
+    return points[keep]
+
+
+def _dr12_nearest(points: np.ndarray, target: np.ndarray, exclude: Optional[set] = None) -> tuple[int, float]:
+    d = np.linalg.norm(points - target, axis=1)
+    if exclude:
+        d = d.copy()
+        d[list(exclude)] = np.inf
+    i = int(np.argmin(d))
+    return i, float(d[i])
+
+
+def _dr12_lattice_basis(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    diff = points[None, :, :] - points[:, None, :]
+    dist = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dist, np.inf)
+    nn = dist.min(axis=1)
+    pitch = float(np.median(nn))
+    vecs = []
+    for i in range(len(points)):
+        for j in np.where((dist[i] > 0.7 * pitch) & (dist[i] < 1.35 * pitch))[0]:
+            v = diff[i, j]
+            if v[0] < 0 or (v[0] == 0 and v[1] < 0):
+                v = -v
+            vecs.append(v)
+    vecs = np.asarray(vecs, float)
+    ang = np.arctan2(vecs[:, 1], vecs[:, 0])
+    feats = np.column_stack([np.cos(2 * ang), np.sin(2 * ang)]).astype(np.float32)
+    _, lab, _ = cv2.kmeans(feats, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-3), 10,
+                           cv2.KMEANS_PP_CENTERS)
+    lab = lab.ravel()
+    e1 = np.median(vecs[lab == 0], axis=0)
+    e2 = np.median(vecs[lab == 1], axis=0)
+    return e1, e2, pitch
+
+
+def _dr12_grow_lattice(points: np.ndarray) -> dict[int, tuple[int, int]]:
+    e1, e2, pitch = _dr12_lattice_basis(points)
+    centroid = points.mean(axis=0)
+    # seed: a well-connected point near the centroid
+    order = np.argsort(np.linalg.norm(points - centroid, axis=1))
+    seed = None
+    for idx in order[:30]:
+        hits = sum(_dr12_nearest(points, points[idx] + s * e)[1] < 0.3 * pitch for e in (e1, e2) for s in (1, -1))
+        if hits >= 3:
+            seed = int(idx)
+            break
+    if seed is None:
+        seed = int(order[0])
+    coords = {seed: (0, 0)}
+    taken = {(0, 0): seed}
+    queue = deque([(seed, e1, e2)])
+    while queue:
+        idx, a, b = queue.popleft()
+        i0, j0 = coords[idx]
+        p = points[idx]
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            for step in (1, 2):
+                ci, cj = i0 + di * step, j0 + dj * step
+                if (ci, cj) in taken:
+                    break
+                target = p + step * (di * a + dj * b)
+                q, d = _dr12_nearest(points, target)
+                if d > 0.28 * pitch or q in coords:
+                    continue
+                coords[q] = (ci, cj)
+                taken[(ci, cj)] = q
+                delta = (points[q] - p) / step
+                na = delta * di if di else a
+                nb = delta * dj if dj else b
+                queue.append((q, na, nb))
+                break
+    return coords
+
+
+def _dr12_fit_homography(points: np.ndarray, coords: dict[int, tuple[int, int]], pitch: float):
+    idx = list(coords)
+    src = np.array([coords[i] for i in idx], np.float32)
+    dst = points[idx].astype(np.float32)
+    H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 0.2 * pitch)
+    for _ in range(3):
+        inv = np.linalg.inv(H)
+        can = cv2.perspectiveTransform(points.reshape(-1, 1, 2).astype(np.float32), inv).reshape(-1, 2)
+        rounded = np.round(can)
+        ok = np.linalg.norm(can - rounded, axis=1) < 0.22
+        # one point per lattice cell
+        cells = {}
+        for k in np.where(ok)[0]:
+            key = tuple(rounded[k].astype(int))
+            err = np.linalg.norm(can[k] - rounded[k])
+            if key not in cells or err < cells[key][1]:
+                cells[key] = (k, err)
+        if len(cells) < 8:
+            break
+        src = np.array(list(cells), np.float32)
+        dst = points[[v[0] for v in cells.values()]].astype(np.float32)
+        H, _ = cv2.findHomography(src, dst, 0)
+    return H, {v[0]: k for k, v in cells.items()}
+
+
+def _dr12_sample(gray_blur: np.ndarray, H: np.ndarray, uv: np.ndarray) -> np.ndarray:
+    pts = cv2.perspectiveTransform(uv.reshape(-1, 1, 2).astype(np.float32), H).reshape(-1, 2)
+    h, w = gray_blur.shape
+    out = np.full(len(pts), np.nan)
+    inside = (pts[:, 0] >= 0) & (pts[:, 0] < w - 1) & (pts[:, 1] >= 0) & (pts[:, 1] < h - 1)
+    if inside.any():
+        p = pts[inside]
+        out[inside] = cv2.remap(gray_blur, p[:, 0].reshape(-1, 1).astype(np.float32),
+                                p[:, 1].reshape(-1, 1).astype(np.float32), cv2.INTER_LINEAR).ravel()
+    return out
+
+
+def _dr12_cell_wall_score(gray_blur: np.ndarray, H: np.ndarray, i: int, j: int) -> float:
+    """Beige walls on all four sides of a plate cell, darker corners inside."""
+    walls = np.array([[i + 0.5, j + 0.25], [i + 0.5, j - 0.25], [i - 0.5, j + 0.25], [i - 0.5, j - 0.25],
+                      [i + 0.25, j + 0.5], [i - 0.25, j + 0.5], [i + 0.25, j - 0.5], [i - 0.25, j - 0.5]])
+    inner = np.array([[i + 0.3, j + 0.3], [i - 0.3, j + 0.3], [i + 0.3, j - 0.3], [i - 0.3, j - 0.3]])
+    w = _dr12_sample(gray_blur, H, walls)
+    c = _dr12_sample(gray_blur, H, inner)
+    if np.isnan(w).any() or np.isnan(c).any():
+        return -50.0
+    # walls must be uniformly bright: penalise the darkest wall sample
+    return float(0.5 * np.mean(w) + 0.5 * np.min(w) - np.mean(c))
+
+
+def _dr12_place_window(work_bgr: np.ndarray, H: np.ndarray, cells: dict[int, tuple[int, int]]):
+    """Choose the 8 x 12 window (either axis assignment). Returns canonical H [v(12), u(8)] -> work px."""
+    gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (0, 0), max(1.0, max(gray.shape) / 900)).astype(np.float32)
+    ij = np.array(list(cells.values()))
+    imin, jmin = ij.min(axis=0)
+    imax, jmax = ij.max(axis=0)
+    cache: dict[tuple[int, int], float] = {}
+
+    def cs(i, j):
+        if (i, j) not in cache:
+            cache[(i, j)] = _dr12_cell_wall_score(gray, H, i, j)
+        return cache[(i, j)]
+
+    best = None
+    for ni, nj in ((8, 12), (12, 8)):
+        for i0 in range(imax - ni + 1 - 2, imin + 3):
+            for j0 in range(jmax - nj + 1 - 2, jmin + 3):
+                inside = ((ij[:, 0] >= i0) & (ij[:, 0] < i0 + ni) & (ij[:, 1] >= j0) & (ij[:, 1] < j0 + nj)).sum()
+                missing = len(ij) - inside
+                walls = sum(cs(i, j) for i in range(i0, i0 + ni) for j in range(j0, j0 + nj)) / (ni * nj)
+                score = walls - 6.0 * missing
+                if best is None or score > best[0]:
+                    best = (score, ni, nj, i0, j0, missing, walls)
+    score, ni, nj, i0, j0, missing, walls = best
+    # canonical (v along 12-axis, u along 8-axis) -> lattice (i, j)
+    if ni == 8:  # i is the 8-axis (u), j is the 12-axis (v)
+        T = np.array([[0, 1, i0], [1, 0, j0], [0, 0, 1]], float)
+    else:  # i is the 12-axis (v), j is the 8-axis (u)
+        T = np.array([[1, 0, i0], [0, 1, j0], [0, 0, 1]], float)
+    return H @ T, {"missing": int(missing), "wall_score": float(walls), "window": (ni, nj, i0, j0)}
+
+
+def _dr12_fit_double_rib_lattice(image_bgr: np.ndarray, codes=None):
+    """Return (H_full canonical[v,u] -> full-res px, diagnostics, codes)."""
+    # k-means in the basis estimate draws from OpenCV's global RNG; seed it so
+    # the same photo always yields the same grid (and the same reads).
+    cv2.setRNGSeed(12345)
+    work, s = _dr12_work_image(image_bgr)
+    sq, sizes = _dr12_dark_square_candidates(work)
+    sq = _dr12_dominant_size_filter(sq, sizes)
+    if codes is None:
+        codes = _dr12_full_image_codes(image_bgr)
+    code_pts = np.array([c for _, c, _ in codes], float).reshape(-1, 2) * s
+    pts = np.vstack([sq, code_pts]) if len(code_pts) else sq
+    # merge near-duplicates (a decoded tube inside a detected square)
+    merged = []
+    for p in pts:
+        if all(np.linalg.norm(p - q) > max(work.shape) / 60 for q in merged):
+            merged.append(p)
+    pts = np.asarray(merged, float)
+    if len(pts) < 12:
+        raise RuntimeError("Too few well openings or tube codes were found to fit the double-rib grid.")
+    coords = _dr12_grow_lattice(pts)
+    _, _, pitch = _dr12_lattice_basis(pts)
+    H, cells = _dr12_fit_homography(pts, coords, pitch)
+    Hc, diag = _dr12_place_window(work, H, cells)
+    S_inv = np.diag([1 / s, 1 / s, 1.0])
+    diag.update({"points": len(pts), "squares": len(sq), "codes": len(codes), "lattice_cells": len(cells),
+                 "pitch_work": pitch})
+    return S_inv @ Hc, diag, codes
+
+
+# ---------------------------------------------------------------- analysis
+
+_DR12_PRESENCE_HP_THRESHOLD = 14.0
+_DR12_YY, _DR12_XX = np.mgrid[0:100, 0:100]
+_DR12_INNER = np.hypot(_DR12_XX - 49.5, _DR12_YY - 49.5) < 28
+
+
+def _dr12_presence_texture(crop100_bgr: np.ndarray) -> float:
+    """Fine (Data-Matrix-scale) texture inside the tube-cap circle of a 100 px/pitch crop.
+
+    Empty wells - including bright glare on the tray floor and lit walls - are
+    smooth at this scale; a tube cap carries the dot pattern of its code.
+    """
+    g = cv2.cvtColor(crop100_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    hp = g - cv2.GaussianBlur(g, (0, 0), 3)
+    return float(hp[_DR12_INNER].std())
+
+
+def _dr12_canonical_of(points_xy: np.ndarray, H: np.ndarray) -> np.ndarray:
+    return cv2.perspectiveTransform(np.asarray(points_xy, np.float32).reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
+
+
+def _dr12_well_crop_fullres(image_bgr: np.ndarray, H: np.ndarray, v: int, u: int, size: Optional[int] = None) -> np.ndarray:
+    """Perspective-corrected one-pitch crop of well (v, u) straight from the full-resolution photo."""
+    if size is None:
+        c = cv2.perspectiveTransform(np.float32([[[v, u]], [[v + 1, u]], [[v, u + 1]]]), H).reshape(-1, 2)
+        native = 0.5 * (np.linalg.norm(c[1] - c[0]) + np.linalg.norm(c[2] - c[0]))
+        size = int(np.clip(native, 180, 420))
+    A = np.array([[0, 1.0 / size, v - 0.5], [1.0 / size, 0, u - 0.5], [0, 0, 1]], float)
+    return cv2.warpPerspective(image_bgr, H @ A, (size, size), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+                               borderMode=cv2.BORDER_REPLICATE)
+
+
+def _dr12_decode_well(crop_bgr: np.ndarray, exclude: set[str]) -> tuple[Optional[str], int]:
+    """Try progressively heavier preprocessing; returns (text, number of agreeing reads)."""
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4)).apply(gray)
+    votes: dict[str, int] = {}
+
+    def read(img):
+        for binarizer in (zxingcpp.Binarizer.LocalAverage, zxingcpp.Binarizer.GlobalHistogram):
+            for code in zxingcpp.read_barcodes(img, formats=zxingcpp.BarcodeFormat.DataMatrix, binarizer=binarizer):
+                t = code.text.strip().lower()
+                if t and t not in exclude:
+                    votes[t] = votes.get(t, 0) + 1
+
+    stages = [
+        lambda: [gray, clahe] + ([cv2.resize(gray, None, fx=0.55, fy=0.55, interpolation=cv2.INTER_AREA)]
+                                 if gray.shape[0] > 300 else []),
+        lambda: [cv2.resize(x, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC) for f in (1.6, 2.4) for x in (gray, clahe)],
+        lambda: [cv2.GaussianBlur(gray, (0, 0), 1.2), cv2.medianBlur(clahe, 3),
+                 cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]],
+    ]
+    for stage in stages:
+        for img in stage():
+            read(img)
+        if votes:
+            break
+    if not votes:
+        # Dot-peen symbols: modules are separate dots with gaps, which zxing
+        # often cannot assemble. Merge the dots (blur / close / dilate) at a few
+        # scales; no single variant wins on every tube, so sweep and stop early.
+        n = gray.shape[0]
+        for f in (1.0, 0.6, 0.45):
+            if n * f < 90:
+                continue
+            x = gray if f == 1.0 else cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+            sweep = [x] + [cv2.GaussianBlur(x, (0, 0), sig * f) for sig in (1.5, 2.5, 3.5)]
+            for k in (3, 5, 7):
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, int(round(k * f)) | 1),) * 2)
+                sweep += [cv2.morphologyEx(x, cv2.MORPH_CLOSE, kernel), cv2.dilate(x, kernel)]
+            for img in sweep:
+                read(img)
+                if votes:
+                    break
+            if votes:
+                break
+    if not votes:
+        # Last resort: blank everything outside the cap (clean quiet zone) and
+        # try small rotations - zxing's sampling grid sometimes locks on only
+        # after the symbol is turned a few degrees.
+        n = gray.shape[0]
+        yy, xx = np.mgrid[0:n, 0:n]
+        rr = np.hypot(xx - n / 2.0, yy - n / 2.0)
+        masked = gray.copy()
+        masked[rr > 0.30 * n] = int(np.percentile(gray[rr < 0.2 * n], 10))
+        for f in (0.6, 0.45, 1.0):
+            if n * f < 90:
+                continue
+            x = masked if f == 1.0 else cv2.resize(masked, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+            h2, w2 = x.shape
+            for base in (x, cv2.GaussianBlur(x, (0, 0), 2.5 * f)):
+                for ang in (10, -10, 5, -5, 15, -15, 30, 45):
+                    M = cv2.getRotationMatrix2D((w2 / 2.0, h2 / 2.0), ang, 1.0)
+                    read(cv2.warpAffine(base, M, (w2, h2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE))
+                    if votes:
+                        break
+                if votes:
+                    break
+            if votes:
+                break
+    if not votes:
+        return None, 0
+    text = max(votes, key=votes.get)
+    return text, votes[text]
+
+
+def _analyze_double_rib_v12(image_bgr: np.ndarray, plate_id_override=None, corner_override=None):
+    H, diag, codes = _dr12_fit_double_rib_lattice(image_bgr)
+    Ho, rib_score = _orient_double_rib_homography(image_bgr, H, corner_override=corner_override)
+    rect = _rectify_double_rib_final(image_bgr, Ho, scale=100)
+
+    # Whole-image codes -> wells (or external plate marker).
+    by_well: dict[tuple[int, int], str] = {}
+    external: list[str] = []
+    if codes:
+        can = _dr12_canonical_of(np.array([c for _, c, _ in codes]), Ho)
+        for (text, _, _), (v, u) in zip(codes, can):
+            vi, ui = int(round(v)), int(round(u))
+            if 0 <= vi < 12 and 0 <= ui < 8 and abs(v - vi) < 0.45 and abs(u - ui) < 0.45:
+                by_well.setdefault((vi, ui), text)
+            elif v < -0.9 or v > 11.9 or u < -0.9 or u > 7.9:
+                external.append(text)
+    plate_id = (plate_id_override or "").strip().lower() or (external[0] if external else "UNREADABLE")
+
+    known = set(by_well.values()) | set(external)
+    cells = [(v, u) for v in range(12) for u in range(8)]
+    crops100 = {(v, u): rect[int((v + 1.5) * 100) - 50:int((v + 1.5) * 100) + 50,
+                             int((u + 1.5) * 100) - 50:int((u + 1.5) * 100) + 50].copy() for v, u in cells}
+    texture = {k: _dr12_presence_texture(c) for k, c in crops100.items()}
+
+    todo = [k for k in cells if k not in by_well and texture[k] >= _DR12_PRESENCE_HP_THRESHOLD]
+
+    def work(k):
+        crop = _dr12_well_crop_fullres(image_bgr, Ho, *k)
+        text, n = _dr12_decode_well(crop, known)
+        if not text:
+            # Borderline symbols can hinge on resampling; retry the same well
+            # rendered at two other sizes before calling it unreadable.
+            for f in (0.75, 1.3):
+                size = int(np.clip(crop.shape[0] * f, 150, 520))
+                text, n = _dr12_decode_well(_dr12_well_crop_fullres(image_bgr, Ho, *k, size=size), known)
+                if text:
+                    break
+        return k, (text, n)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        decoded = dict(pool.map(work, todo))
+
+    wells = []
+    for v, u in cells:
+        pos = f"{ROWS[u]}{v + 1}"
+        hp = texture[(v, u)]
+        if (v, u) in by_well:
+            value, conf, occ = by_well[(v, u)], 96.0, True
+        elif hp < _DR12_PRESENCE_HP_THRESHOLD:
+            # distance from the threshold drives confidence; 10-14 is a review band
+            value, occ = "EMPTY", False
+            conf = float(np.clip(100.0 - 6.0 * max(0.0, hp - 6.0), 55.0, 98.0))
+        else:
+            text, n = decoded.get((v, u), (None, 0))
+            occ = True
+            if text:
+                value, conf = text, (92.0 if n >= 2 else 82.0)
+            else:
+                value, conf = "UNREADABLE", float(np.clip(20.0 + hp / 3.0, 20.0, 40.0))
+        wells.append(WellResult(position=pos, value=value, confidence=conf,
+                                     crop_rgb=cv2.cvtColor(crops100[(v, u)], cv2.COLOR_BGR2RGB), occupied=occ,
+                                     center_xy=((u + 1.5) * 100.0, (v + 1.5) * 100.0)))
+    _enforce_unique_codes(wells)
+    _sort_wells_canonical(wells)
+    overlay = _draw_overlay(rect, wells)
+    diag.update({"rib_score": rib_score, "whole_image_wells": len(by_well), "crop_decoded": sum(1 for t, _ in decoded.values() if t),
+                 "external_codes": external})
+    return RackResult(plate_id=plate_id, wells=wells, normalized_rgb=cv2.cvtColor(rect, cv2.COLOR_BGR2RGB),
+                           overlay_rgb=overlay, profile_name="Double-rib plate — v12 lattice / H12 rib anchor"), diag
+
+
+def analyze_double_rib_plate(
+    image_bgr: np.ndarray,
+    plate_id_override: Optional[str] = None,
+    double_rib_corner_override: Optional[str] = None,
+) -> RackResult:
+    """v12 analysis; falls back to the v11 path only if the v12 lattice cannot be fitted."""
+    try:
+        result, _ = _analyze_double_rib_v12(
+            image_bgr,
+            plate_id_override=plate_id_override,
+            corner_override=double_rib_corner_override,
+        )
+        return result
+    except Exception as v12_error:
+        try:
+            return analyze_double_rib_plate_legacy(
+                image_bgr,
+                plate_id_override=plate_id_override,
+                double_rib_corner_override=double_rib_corner_override,
+            )
+        except Exception:
+            raise RuntimeError(f"Double-rib analysis failed: {v12_error}") from v12_error
+
+
+def _dr12_wall_beige_fraction(image_bgr: np.ndarray, H: np.ndarray) -> float:
+    """Fraction of wall midpoints between fitted wells that are beige plastic.
+
+    Reference photos: Double-rib 0.96-1.00; Original tray and Notched plate <= 0.55.
+    """
+    hsv = cv2.cvtColor(cv2.GaussianBlur(image_bgr, (0, 0), 2), cv2.COLOR_BGR2HSV)
+    pts = []
+    for v in range(12):
+        for u in range(8):
+            pts += [[v + 0.5, u + 0.25], [v + 0.5, u - 0.25], [v + 0.25, u + 0.5], [v - 0.25, u + 0.5]]
+    xy = cv2.perspectiveTransform(np.float32(pts).reshape(-1, 1, 2), H).reshape(-1, 2).astype(int)
+    h, w = image_bgr.shape[:2]
+    xy = xy[(xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)]
+    if len(xy) == 0:
+        return 0.0
+    s = hsv[xy[:, 1], xy[:, 0]].astype(np.int32)
+    beige = (s[:, 0] >= 8) & (s[:, 0] <= 30) & (s[:, 1] >= 25) & (s[:, 1] <= 120) & (s[:, 2] >= 110)
+    return float(beige.mean())
+
+
+def _double_rib_auto_evidence_v12(image_bgr: np.ndarray) -> tuple[bool, str]:
+    """Auto gate: beige square-well lattice, usable H12 rib anchor, and no
+    rack/plate marker other than a tray label beside H12."""
+    H, diag, codes = _dr12_fit_double_rib_lattice(image_bgr)
+    if diag["lattice_cells"] < 48:
+        return False, f"only {diag['lattice_cells']} lattice cells (need at least 48)"
+    beige = _dr12_wall_beige_fraction(image_bgr, H)
+    if beige < 0.80:
+        return False, f"well walls are not beige double-rib plastic (beige fraction {beige:.2f})"
+    try:
+        Ho, rib_score = _orient_double_rib_homography(image_bgr, H, corner_override="auto")
+    except Exception as exc:
+        return False, f"H12 double-rib anchor failed: {exc}"
+    tray_labels = []
+    if codes:
+        # A tube code sits on a lattice point; a rack/plate marker sits between
+        # wells (Original tray: half a pitch off the edge row) or outside them.
+        # A double-rib plate can sit in a labelled tray whose rack Data Matrix
+        # is in the margin beside H12 (the paired-rib corner); that one is
+        # allowed. The beige-wall check above is what rules out Original and
+        # Notched racks, whose marker can land in a similar spot.
+        can = _dr12_canonical_of(np.array([c for _, c, _ in codes]), Ho)
+        markers = [(t, v, u) for (t, _, _), (v, u) in zip(codes, can)
+                   if max(abs(v - round(v)), abs(u - round(u))) > 0.3
+                   or not (-0.5 < v < 11.5 and -0.5 < u < 7.5)]
+        blocking = [t for t, v, u in markers if not _dr12_beside_h12(v, u)]
+        if blocking:
+            return False, "plate/rack Data Matrix detected: " + ", ".join(blocking[:3])
+        tray_labels = [t for t, _, _ in markers]
+    label_note = f"tray label beside H12: {', '.join(tray_labels[:3])}" if tray_labels else "no external plate-ID barcode"
+    return True, f"lattice cells={diag['lattice_cells']}, beige={beige:.2f}, H12 rib score={rib_score:.2f}, {label_note}"
+
+
+def _dr12_beside_h12(v: float, u: float) -> bool:
+    """True for a point in the tray margin around H12 (canonical v=11, u=7), outside the well field."""
+    outside = v > 11.5 or u > 7.5
+    return outside and 10.0 <= v <= 13.5 and 5.5 <= u <= 9.5
+
 
 def analyze_image_bytes(
     image_bytes: bytes,
@@ -2314,7 +2860,7 @@ def analyze_image_bytes(
     errors = []
 
     try:
-        is_double_rib, reason = _double_rib_auto_evidence(image_bgr)
+        is_double_rib, reason = _double_rib_auto_evidence_v12(image_bgr)
         if is_double_rib:
             return analyze_double_rib_plate(
                 image_bgr,
