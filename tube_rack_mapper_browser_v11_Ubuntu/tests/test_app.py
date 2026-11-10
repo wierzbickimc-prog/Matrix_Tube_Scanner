@@ -1,6 +1,7 @@
 """Session regressions: a CSV must always belong to the currently chosen photo."""
 import base64
 import io
+import os
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -30,6 +31,11 @@ class AppTests(unittest.TestCase):
         self.decoder = self.decoder_patch.start()
         self.addCleanup(self.component_patch.stop)
         self.addCleanup(self.decoder_patch.stop)
+        # Webcam mode is disabled by default; these session tests drive it
+        # because it is the scriptable way to inject a photo.
+        self.env_patch = patch.dict(os.environ, {"TUBE_SCANNER_WEBCAM": "1"})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         self.app = AppTest.from_file(str(APP)).run()
         self.app.radio[0].set_value("Webcam").run()
 
@@ -81,6 +87,17 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(self.app.exception), 0)
         self.assertEqual(self.app.radio[0].value, "Upload image")
         self.assertNotIn("rack_result", self.app.session_state)
+
+
+class WebcamDisabledTests(unittest.TestCase):
+    def test_webcam_is_not_offered_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TUBE_SCANNER_WEBCAM", None)
+            app = AppTest.from_file(str(APP)).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.radio), 0)
+        self.assertEqual(len(app.get("file_uploader")), 1)
+        self.assertNotIn("webcam", " ".join(c.value for c in app.caption).lower())
 
 
 if __name__ == "__main__":

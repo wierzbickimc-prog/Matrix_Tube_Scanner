@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -11,6 +12,9 @@ from capture import camera_image, source_key
 from core import REVIEW_THRESHOLD, RackResult, analyze_image_bytes
 
 ROOT = Path(__file__).resolve().parent
+# Webcam capture is off: real webcam frames are too soft to decode the tube
+# Data Matrix codes (0/73 on a full rack). Set TUBE_SCANNER_WEBCAM=1 to re-enable.
+WEBCAM_ENABLED = os.environ.get("TUBE_SCANNER_WEBCAM") == "1"
 LOGO = ROOT / "assets" / "scanner.svg"
 webcam = components.declare_component("built_rack_camera", path=str(ROOT / "webcam"))
 st.set_page_config(page_title="Built Tube Scanner", page_icon=str(LOGO), layout="wide")
@@ -24,7 +28,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.title("Every tube. In its place.")
-st.caption("Capture a rack, review the tube codes, and export a plate map.")
+st.caption("Upload a rack photo, review the tube codes, and export a plate map.")
 
 
 def change_source():
@@ -35,7 +39,10 @@ def change_source():
 if st.session_state.pop("exit_camera", False):
     st.session_state["image_source"] = "Upload image"
     change_source()
-mode = st.radio("Image source", ["Upload image", "Webcam"], horizontal=True, key="image_source", on_change=change_source)
+if WEBCAM_ENABLED:
+    mode = st.radio("Image source", ["Upload image", "Webcam"], horizontal=True, key="image_source", on_change=change_source)
+else:
+    mode = "Upload image"
 image_bytes = None
 with st.container(border=True, key="capture_card"):
     if mode == "Upload image":
@@ -86,7 +93,7 @@ with st.container(border=True, key="scan_card"):
         st.session_state.pop("result_source", None)
     start = st.button("Start analysis", type="primary", disabled=image_bytes is None)
     if image_bytes is None:
-        st.caption("Upload an image or choose a webcam photo to continue.")
+        st.caption("Upload an image or choose a webcam photo to continue." if WEBCAM_ENABLED else "Upload an image to continue.")
 
 if start and image_bytes is not None:
     # Clear previous edits even when explicitly reanalyzing the same photo.
