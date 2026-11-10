@@ -2786,27 +2786,42 @@ def _dr12_wall_beige_fraction(image_bgr: np.ndarray, H: np.ndarray) -> float:
 
 
 def _double_rib_auto_evidence_v12(image_bgr: np.ndarray) -> tuple[bool, str]:
-    """Auto gate: beige square-well lattice, no rack/plate marker, usable H12 rib anchor."""
+    """Auto gate: beige square-well lattice, usable H12 rib anchor, and no
+    rack/plate marker other than a tray label beside H12."""
     H, diag, codes = _dr12_fit_double_rib_lattice(image_bgr)
     if diag["lattice_cells"] < 48:
         return False, f"only {diag['lattice_cells']} lattice cells (need at least 48)"
     beige = _dr12_wall_beige_fraction(image_bgr, H)
     if beige < 0.80:
         return False, f"well walls are not beige double-rib plastic (beige fraction {beige:.2f})"
+    try:
+        Ho, rib_score = _orient_double_rib_homography(image_bgr, H, corner_override="auto")
+    except Exception as exc:
+        return False, f"H12 double-rib anchor failed: {exc}"
+    tray_labels = []
     if codes:
         # A tube code sits on a lattice point; a rack/plate marker sits between
         # wells (Original tray: half a pitch off the edge row) or outside them.
-        can = _dr12_canonical_of(np.array([c for _, c, _ in codes]), H)
-        markers = [t for (t, _, _), (v, u) in zip(codes, can)
+        # A double-rib plate can sit in a labelled tray whose rack Data Matrix
+        # is in the margin beside H12 (the paired-rib corner); that one is
+        # allowed. The beige-wall check above is what rules out Original and
+        # Notched racks, whose marker can land in a similar spot.
+        can = _dr12_canonical_of(np.array([c for _, c, _ in codes]), Ho)
+        markers = [(t, v, u) for (t, _, _), (v, u) in zip(codes, can)
                    if max(abs(v - round(v)), abs(u - round(u))) > 0.3
                    or not (-0.5 < v < 11.5 and -0.5 < u < 7.5)]
-        if markers:
-            return False, "plate/rack Data Matrix detected: " + ", ".join(markers[:3])
-    try:
-        _, rib_score = _orient_double_rib_homography(image_bgr, H, corner_override="auto")
-    except Exception as exc:
-        return False, f"H12 double-rib anchor failed: {exc}"
-    return True, f"lattice cells={diag['lattice_cells']}, H12 rib score={rib_score:.2f}, no external plate-ID barcode"
+        blocking = [t for t, v, u in markers if not _dr12_beside_h12(v, u)]
+        if blocking:
+            return False, "plate/rack Data Matrix detected: " + ", ".join(blocking[:3])
+        tray_labels = [t for t, _, _ in markers]
+    label_note = f"tray label beside H12: {', '.join(tray_labels[:3])}" if tray_labels else "no external plate-ID barcode"
+    return True, f"lattice cells={diag['lattice_cells']}, beige={beige:.2f}, H12 rib score={rib_score:.2f}, {label_note}"
+
+
+def _dr12_beside_h12(v: float, u: float) -> bool:
+    """True for a point in the tray margin around H12 (canonical v=11, u=7), outside the well field."""
+    outside = v > 11.5 or u > 7.5
+    return outside and 10.0 <= v <= 13.5 and 5.5 <= u <= 9.5
 
 
 def analyze_image_bytes(

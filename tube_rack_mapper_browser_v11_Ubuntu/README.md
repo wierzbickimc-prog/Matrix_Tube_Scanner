@@ -238,3 +238,21 @@ then a retry at two other crop sizes. The lattice RNG is seeded so a photo
 always gives the same result. The 36-tube photo
 (`test_images/double_rib_36_fullres.jpg`, scattered gaps) reads 36/36.
 `tests/test_double_rib.py` covers all three cases.
+
+### Labelled double-rib trays
+
+A double-rib plate can sit in a tray with a rack Data Matrix in the margin
+beside H12. Auto used to treat any off-lattice code as an Original/Notched
+marker, so such a tray fell through to a wrong Notched-plate result with a tube
+code as the plate ID. Auto now orients on the H12 ribs first and allows a code
+in the H12 margin; that code becomes the plate ID. The beige-wall check is what
+separates double-rib from Original and Notched racks (0.96-1.00 vs <= 0.55 on
+the reference photos). `tests/test_profiles.py` covers the labelled tray
+(`test_images/double_rib_tray_label_full_res.jpg`, 73 tubes, plate
+`ts05378298`) and Auto profile choice on every reference photo.
+
+### Webcam capture disabled
+
+Real webcam frames were too soft to decode tube codes (0/73 on a full rack), so
+the Webcam source is hidden. Set `TUBE_SCANNER_WEBCAM=1` in the service
+environment to bring it back for testing.
